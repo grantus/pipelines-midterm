@@ -12,7 +12,12 @@ final case class LogEvent(
                            raw: String
                          )
 
-final case class ParseError(index: Long, raw: String, reason: String)
+final case class ParseError(
+                             index: Long,
+                             source: String,
+                             raw: String,
+                             reason: String
+                           )
 
 final case class SearchEvent(
                               index: Long,

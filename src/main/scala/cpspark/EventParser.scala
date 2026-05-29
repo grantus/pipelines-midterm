@@ -26,7 +26,8 @@ object EventParser {
                                     eventType: String,
                                     timestampMs: Option[Long],
                                     day: Option[String],
-                                    index: Long
+                                    index: Long,
+                                    raw: String
                                   )
 
   private case class PlainParseResult(
@@ -36,37 +37,69 @@ object EventParser {
 
   def parse(line: String, index: Long): Either[ParseError, LogEvent] = {
     val trimmed = Option(line).map(_.trim).getOrElse("")
-    if (trimmed.isEmpty) Left(ParseError(index, line, "empty line"))
+    if (trimmed.isEmpty) Left(ParseError(index, "__single_line__", line, "empty line"))
     else {
       parseJson(trimmed, index, sessionIdOverride = None)
         .orElse(parseText(trimmed, index))
-        .toRight(ParseError(index, line, "unknown event format"))
+        .toRight(ParseError(index, "__single_line__", line, "unknown event format"))
     }
   }
 
   def parseFile(filePath: String, content: String): Seq[Either[ParseError, LogEvent]] = {
     val sessionId = filePath.split("[/\\\\]").lastOption.getOrElse(filePath)
     var pendingSearch = Option.empty[PendingSearch]
+    val out = Vector.newBuilder[Either[ParseError, LogEvent]]
 
-    content.split("\\R", -1).toSeq.zipWithIndex.flatMap { case (line, lineIndex) =>
+    content.split("\\R", -1).toSeq.zipWithIndex.foreach { case (line, lineIndex) =>
       val index = lineIndex.toLong
       val trimmed = Option(line).map(_.trim).getOrElse("")
 
-      if (trimmed.isEmpty) {
-        None
-      } else {
+      if (trimmed.nonEmpty) {
         parseJson(trimmed, index, sessionIdOverride = Some(sessionId)) match {
           case Some(event) =>
+            pendingSearch.foreach { search =>
+              out += Left(ParseError(
+                search.index,
+                filePath,
+                search.raw,
+                s"${search.eventType} has no result-list line before JSON event"
+              ))
+            }
+
             pendingSearch = None
-            Some(Right(event))
+            out += Right(event)
 
           case None =>
-            val parsed = parsePlainLine(trimmed, index, sessionId, pendingSearch)
+            val startsNewEvent = TextEventRegex.findFirstMatchIn(trimmed).isDefined
+
+            if (startsNewEvent && pendingSearch.nonEmpty) {
+              val search = pendingSearch.get
+              out += Left(ParseError(
+                search.index,
+                filePath,
+                search.raw,
+                s"${search.eventType} has no result-list line before next event"
+              ))
+              pendingSearch = None
+            }
+
+            val parsed = parsePlainLine(trimmed, index, sessionId, pendingSearch, filePath)
             pendingSearch = parsed.nextPending
-            parsed.output
+            parsed.output.foreach(out += _)
         }
       }
     }
+
+    pendingSearch.foreach { search =>
+      out += Left(ParseError(
+        search.index,
+        filePath,
+        search.raw,
+        s"${search.eventType} has no result-list line before end of file"
+      ))
+    }
+
+    out.result()
   }
 
   private def parseJson(line: String, index: Long, sessionIdOverride: Option[String]): Option[LogEvent] = {
@@ -104,7 +137,7 @@ object EventParser {
   }
 
   private def parseText(line: String, index: Long): Option[LogEvent] = {
-    parsePlainLine(line, index, "__NO_SESSION__", None).output.collect {
+    parsePlainLine(line, index, "__NO_SESSION__", None, "__single_line__").output.collect {
       case Right(event) => event
     }
   }
@@ -113,7 +146,8 @@ object EventParser {
                               line: String,
                               index: Long,
                               sessionId: String,
-                              pendingSearch: Option[PendingSearch]
+                              pendingSearch: Option[PendingSearch],
+                              source: String
                             ): PlainParseResult = {
     line match {
       case TextEventRegex(eventType, _) =>
@@ -124,14 +158,16 @@ object EventParser {
             val day = timestampMs.map(ms => Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).toLocalDate.toString)
               .orElse(timeText.flatMap(parseDay))
 
-            val pending = Some(PendingSearch(eventType, timestampMs, day, index))
+            val pending = Some {
+              PendingSearch(eventType, timestampMs, day, index, line)
+            }
 
             PlainParseResult(None, pending)
 
           case "DOC_OPEN" =>
             parseDocOpen(line, index, sessionId) match {
               case Some(event) => PlainParseResult(Some(Right(event)), None)
-              case None => PlainParseResult(Some(Left(ParseError(index, line, "cannot parse DOC_OPEN"))), None)
+              case None => PlainParseResult(Some(Left(ParseError(index, source, line, "cannot parse DOC_OPEN"))), None)
             }
 
           case "SESSION_START" | "SESSION_END" =>
@@ -171,14 +207,28 @@ object EventParser {
               )
 
             case None =>
-              PlainParseResult(None, None)
+              PlainParseResult(
+                Some(Left(ParseError(index, source, line, "result-list line without preceding QS or CARD_SEARCH_START"))),
+                None
+              )
           }
         } else {
-          PlainParseResult(None, pendingSearch)
+          PlainParseResult(
+            Some(Left(ParseError(index, source, line, "numeric line without document ids"))),
+            pendingSearch
+          )
         }
 
       case _ =>
-        PlainParseResult(None, pendingSearch)
+        val reason = pendingSearch match {
+          case Some(search) => s"unrecognized non-empty line while waiting for result-list for ${search.eventType}"
+          case None => "unrecognized non-empty line"
+        }
+
+        PlainParseResult(
+          Some(Left(ParseError(index, source, line, reason))),
+          pendingSearch
+        )
     }
   }
 
