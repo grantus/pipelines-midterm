@@ -1,109 +1,107 @@
 package cpspark
 
-import org.apache.spark.sql.{Dataset, SparkSession}
-import org.apache.spark.sql.functions._
+import cpspark.domain.{Event, ParsedEvent, RejectedLine}
+import cpspark.input.{FileInput, OrderedInputParser}
+import cpspark.jobs.Metrics
+import cpspark.parser.ParserConfig
+import org.apache.spark.sql.SparkSession
+
+import java.time.ZoneId
+
+final case class AppConfig(
+  inputPath: String,
+  outputPath: String,
+  targetDocumentId: String = "ACC_45616",
+  encoding: String = "windows-1251",
+  zoneId: String = "Europe/Moscow"
+)
 
 object Main {
-  private val TargetDoc = "ACC_45616"
-
   def main(args: Array[String]): Unit = {
-    if (args.length < 2) {
-      System.err.println("Usage: spark-submit --class cpspark.Main <jar> <input-path> <output-path>")
-      System.exit(2)
-    }
+    val config = parseArgs(args)
 
-    val inputPath = args(0)
-    val outputPath = args(1)
-
-    val spark = SparkSession.builder()
-      .appName("ConsultantPlus metrics")
+    implicit val spark: SparkSession = SparkSession.builder()
+      .appName("ConsultantPlusSessionMetrics")
       .getOrCreate()
 
-    import spark.implicits._
+    try {
+      val parserConfig = ParserConfig(ZoneId.of(config.zoneId))
 
-    val parsed = spark.sparkContext.wholeTextFiles(inputPath)
-      .flatMap { case (path, content) => EventParser.parseFile(path, content) }
-      .cache()
+      val inputLines = FileInput.readLines(
+        sc = spark.sparkContext,
+        inputPath = config.inputPath,
+        encoding = config.encoding
+      )
 
-    val events: Dataset[LogEvent] = parsed.collect { case Right(e) => e }.toDS().cache()
-    val errors: Dataset[ParseError] = parsed.collect { case Left(e) => e }.toDS()
+      val parsed = OrderedInputParser
+        .parse(
+          lines = inputLines,
+          parserConfig = parserConfig
+        )
+        .cache()
 
-    val acc45616CardSearchCount = events
-      .filter(e => e.eventType == "CARD_SEARCH_START" && e.foundDocs.contains(TargetDoc))
-      .count()
+      val events = parsed.flatMap {
+        case ParsedEvent(event: Event) => Some(event)
+        case _ => None
+      }.cache()
 
-    Seq((TargetDoc, acc45616CardSearchCount))
-      .toDF("document_id", "card_search_count")
-      .coalesce(1)
-      .write.mode("overwrite").option("header", "true")
-      .csv(s"$outputPath/card_search_count_$TargetDoc")
+      val rejects = parsed.flatMap {
+        case RejectedLine(error) => Some(error)
+        case _ => None
+      }.cache()
 
-    val quickSearchOpenings = events.rdd
-      .groupBy(_.sessionId)
-      .flatMap { case (_, sessionEvents) => openingsAttributedToQuickSearch(sessionEvents.toSeq) }
-      .toDS()
+      val eventCount = events.count()
+      val rejectCount = rejects.count()
 
-    val openingsByDayAndDoc = quickSearchOpenings
-      .groupBy(col("day"), col("documentId"))
-      .agg(count(lit(1)).as("openings"))
-      .orderBy(col("day").asc, col("documentId").asc)
+      println(s"Parsed events: $eventCount")
+      println(s"Rejected lines: $rejectCount")
 
-    openingsByDayAndDoc
-      .coalesce(1)
-      .write.mode("overwrite").option("header", "true")
-      .csv(s"$outputPath/quick_search_document_openings_by_day")
+      val searches = Metrics.toSearchRows(events).cache()
+      val opens = Metrics.toDocumentOpenRows(events).cache()
 
-    events.groupBy(col("eventType")).count().orderBy(col("eventType"))
-      .coalesce(1).write.mode("overwrite").option("header", "true")
-      .csv(s"$outputPath/diagnostics_event_type_counts")
+      val cardSearchCount = Metrics.cardSearchCountForDocument(searches, config.targetDocumentId)
+      val quickSearchOpenings = Metrics.quickSearchOpeningsByDay(searches, opens)
 
-    errors.coalesce(1).write.mode("overwrite").option("header", "true")
-      .csv(s"$outputPath/diagnostics_parse_errors")
+      cardSearchCount
+        .coalesce(1)
+        .write
+        .mode("overwrite")
+        .option("header", "true")
+        .csv(s"${config.outputPath}/card_search_count_for_${config.targetDocumentId}")
 
-    spark.stop()
+      quickSearchOpenings
+        .coalesce(1)
+        .write
+        .mode("overwrite")
+        .option("header", "true")
+        .csv(s"${config.outputPath}/quick_search_openings_by_day")
+
+      import spark.implicits._
+      spark.createDataset(rejects)
+        .coalesce(1)
+        .write
+        .mode("overwrite")
+        .json(s"${config.outputPath}/parse_rejects")
+    } finally {
+      spark.stop()
+    }
   }
 
-  def openingsAttributedToQuickSearch(sessionEvents: Seq[LogEvent]): Seq[OpenedFromQuickSearch] = {
-    val ordered = sessionEvents.sortBy(e => (e.timestampMs.getOrElse(Long.MaxValue), e.index))
-    var searchHistory = Vector.empty[SearchEvent]
-    val result = Vector.newBuilder[OpenedFromQuickSearch]
+  private def parseArgs(args: Array[String]): AppConfig = {
+    val params = args.sliding(2, 2).collect {
+      case Array(key, value) if key.startsWith("--") => key.drop(2) -> value
+    }.toMap
 
-    ordered.foreach { event =>
-      event.eventType match {
-        case "QS" | "CARD_SEARCH_START" =>
-          if (event.foundDocs.nonEmpty) {
-            searchHistory :+= SearchEvent(
-              index = event.index,
-              eventType = event.eventType,
-              foundDocs = event.foundDocs.toSet,
-              searchId = event.searchId,
-              day = event.day
-            )
-          }
+    AppConfig(
+      inputPath = required(params, "input"),
+      outputPath = required(params, "output"),
+      targetDocumentId = params.getOrElse("target-document", "ACC_45616"),
+      encoding = params.getOrElse("encoding", "windows-1251"),
+      zoneId = params.getOrElse("zone", "Europe/Moscow")
+    )
+  }
 
-        case "DOC_OPEN" =>
-          event.openedDoc.foreach { docId =>
-            val matchedBySearchId = event.searchId.flatMap { id =>
-              searchHistory.findLast(_.searchId.contains(id))
-            }
-
-            val matchedSearch = matchedBySearchId.orElse {
-              searchHistory.findLast(_.foundDocs.contains(docId))
-            }
-
-            if (matchedSearch.exists(_.eventType == "QS")) {
-              val outputDay = event.day
-                .orElse(matchedSearch.flatMap(_.day))
-                .getOrElse("UNKNOWN_DAY")
-
-              result += OpenedFromQuickSearch(outputDay, docId)
-            }
-          }
-
-        case _ =>
-      }
-    }
-
-    result.result()
+  private def required(params: Map[String, String], name: String): String = {
+    params.getOrElse(name, throw new IllegalArgumentException(s"Missing required argument --$name"))
   }
 }
